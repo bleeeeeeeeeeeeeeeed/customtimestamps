@@ -8,31 +8,23 @@ import { getAssetIDByName } from "@vendetta/ui/assets";
 import { Forms } from "@vendetta/ui/components";
 import { React, ReactNative } from "@vendetta/metro/common";
 
-const { FormSection, FormRow, FormInput, FormDivider, FormText, FormSwitch } = Forms;
+const { FormSection, FormRow, FormInput, FormDivider, FormText } = Forms;
 
 const Icon = (name: string) => {
   const source = getAssetIDByName?.(name);
   return source ? <FormRow.Icon source={source} /> : undefined;
 };
 
-// A reliable toggle: the whole row is tappable via FormRow's onPress (which
-// works everywhere here), and the switch is shown purely for looks with touches
-// passed through to the row, so it can't get into a stuck/unresponsive state.
+// A reliable toggle built only on FormRow.onPress (which works everywhere here),
+// with a plain ON/OFF text indicator — no dependency on FormSwitch, so it can't
+// end up stuck or crash on a build that lacks/behaves oddly with it.
 function ToggleRow({ label, subLabel, leading, value, onToggle }: any) {
   return (
     <FormRow
       label={label}
       subLabel={subLabel}
       leading={leading}
-      trailing={
-        FormSwitch ? (
-          <ReactNative.View pointerEvents="none">
-            <FormSwitch value={!!value} onValueChange={() => {}} />
-          </ReactNative.View>
-        ) : (
-          <FormText>{value ? "On" : "Off"}</FormText>
-        )
-      }
+      trailing={<FormText style={{ fontWeight: "600", opacity: value ? 1 : 0.5 }}>{value ? "ON" : "OFF"}</FormText>}
       onPress={() => onToggle(!value)}
     />
   );
@@ -198,63 +190,6 @@ function restoreAllChannels(): void {
   }
 }
 
-// ---- Stored-timestamp override --------------------------------------------
-// The date divider, day-grouping and "Yesterday/Today" wording are all
-// computed by Discord from the message's own `timestamp`. Relabelling only the
-// rendered header makes the divider disagree with it. So we set the spoofed
-// time on the stored message itself and keep the genuine value to restore.
-// Keyed by message id; we stash the object too so we can tell a reloaded
-// message (fresh object, real time) from one we already rewrote.
-const tsBackup: Record<string, { msg: any; ts: any }> = {};
-
-function buildTimestamp(baseTs: any, custom: number): any {
-  if (typeof baseTs === "string" || baseTs == null) return formatStamp(custom);
-  if (baseTs?.clone && baseTs?.set) {
-    const d = new Date(custom);
-    return baseTs.clone().set({
-      year: d.getFullYear(),
-      month: d.getMonth(),
-      date: d.getDate(),
-      hour: d.getHours(),
-      minute: d.getMinutes(),
-      second: 0,
-      millisecond: 0,
-    });
-  }
-  return moment ? moment(custom) : formatStamp(custom);
-}
-
-function applyTimestamp(msg: any, custom: number): void {
-  if (!msg?.id) return;
-  const id = msg.id;
-  // Capture the genuine timestamp once per message object.
-  if (!tsBackup[id] || tsBackup[id].msg !== msg) tsBackup[id] = { msg, ts: msg.timestamp };
-  msg.timestamp = buildTimestamp(tsBackup[id].ts, custom);
-}
-
-function restoreTimestamp(id: string): void {
-  const entry = tsBackup[id];
-  if (entry && entry.msg) {
-    try { entry.msg.timestamp = entry.ts; } catch {}
-  }
-  delete tsBackup[id];
-}
-
-function restoreAllTimestamps(): void {
-  for (const id of Object.keys(tsBackup)) restoreTimestamp(id);
-}
-
-// Apply an override to the already-loaded stored message right away (not just at
-// render time), so when the channel is reopened the row list — and therefore the
-// date dividers and grouping — is rebuilt from the spoofed time.
-function eagerApply(channelId: string | undefined, id: string, epoch: number): void {
-  try {
-    if (!channelId) return;
-    const msg = MessageStore?.getMessage?.(channelId, id);
-    if (msg) applyTimestamp(msg, epoch);
-  } catch {}
-}
-
 function getMessagesArray(channelId: string): any[] {
   const col = MessageStore?.getMessages?.(channelId);
   if (!col) return [];
@@ -325,8 +260,7 @@ function Settings() {
     const epoch = new Date(Y, M - 1, D, h, mm, 0, 0).getTime();
     if (isNaN(epoch)) { showToast("Invalid date/time"); return; }
     storage.overrides[sel.id] = epoch;
-    eagerApply(sel.channelId, sel.id, epoch);
-    showToast("Saved — reopen the DM to refresh dividers");
+    showToast("Saved — scroll the chat to refresh");
   };
 
   const applySequence = () => {
@@ -345,13 +279,9 @@ function Settings() {
     let applied = 0;
     for (let i = 0; i < lines.length && i < blocks.length; i++) {
       const ep = parseStamp(lines[i]);
-      if (!isNaN(ep)) {
-        storage.overrides[blocks[i].id] = ep;
-        applyTimestamp(blocks[i], ep); // eagerly relabel the loaded message
-        applied++;
-      }
+      if (!isNaN(ep)) { storage.overrides[blocks[i].id] = ep; applied++; }
     }
-    showToast("blocks=" + blocks.length + " applied=" + applied + " — reopen the DM to refresh");
+    showToast("blocks=" + blocks.length + " applied=" + applied + " — scroll to refresh");
   };
 
   const applyDistance = () => {
@@ -388,15 +318,13 @@ function Settings() {
 
     let applied = 0;
     for (let i = 0; i < blocks.length; i++) {
-      const ep = Math.round(start + offsets[i]);
-      storage.overrides[blocks[i].id] = ep;
-      applyTimestamp(blocks[i], ep); // eagerly relabel the loaded message
+      storage.overrides[blocks[i].id] = Math.round(start + offsets[i]);
       applied++;
     }
     showToast(
       "Distanced " + applied + " blocks" +
       (shifted ? " (shifted back to fit before now)" : "") +
-      " — reopen the DM to refresh"
+      " — scroll to refresh"
     );
   };
 
@@ -533,7 +461,7 @@ function Settings() {
           label="Clear all overrides"
           leading={Icon("ic_trash_24px")}
           disabled={!ovrIds.length}
-          onPress={() => { storage.overrides = {}; restoreAllTimestamps(); showToast("Cleared all overrides"); }}
+          onPress={() => { storage.overrides = {}; showToast("Cleared all overrides"); }}
         />
         {ovrIds.length === 0 ? (
           <>
@@ -548,7 +476,7 @@ function Settings() {
                 label={formatStamp(ovr[id])}
                 subLabel={"Tap to remove · " + id}
                 leading={Icon("ic_timer")}
-                onPress={() => { delete storage.overrides[id]; restoreTimestamp(id); showToast("Removed"); }}
+                onPress={() => { delete storage.overrides[id]; showToast("Removed"); }}
               />
             </React.Fragment>
           ))
@@ -560,26 +488,41 @@ function Settings() {
 
 // ---------------- Patches ----------------
 function setup() {
-  // 1) DISPLAY + GROUPING: set the spoofed time on the stored message so the
-  // header, the date divider, day-grouping and "Yesterday/Today" wording all
-  // read the same value and stay consistent. This runs *before* generate so the
-  // date-divider text (which generate bakes in eagerly) is built from the
-  // spoofed time too — an `after` hook was too late for it. The genuine time is
-  // stashed and restored when the override is removed or the plugin unloads.
+  // 1) DISPLAY: replace the rendered timestamp for overridden messages. We swap
+  // the timestamp on a shallow copy of the message *after* generate has run, so
+  // Discord's own generate never receives our value — feeding it a rebuilt
+  // timestamp crashed the client ("undefined is not a function"). This keeps the
+  // header relabel safe and fully reversible.
   if (RowManager?.prototype?.generate) {
     patches.push(
-      before("generate", RowManager.prototype, ([data]: any) => {
+      after("generate", RowManager.prototype, ([data]: any, row: any) => {
         try {
-          const msg = data?.message;
-          const id = msg?.id;
-          if (!id) return;
+          const id = row?.message?.id;
+          if (!id || storage.overrides[id] == null) return;
           const custom = storage.overrides[id];
-          if (custom != null) applyTimestamp(msg, custom);
-          else if (tsBackup[id]) restoreTimestamp(id); // override was removed
+          const ts = row.message.timestamp;
+          let newTs: any = ts;
+          if (typeof ts === "string" || ts == null) {
+            newTs = formatStamp(custom);
+          } else if (ts?.clone && ts?.set) {
+            const d = new Date(custom);
+            newTs = ts.clone().set({
+              year: d.getFullYear(),
+              month: d.getMonth(),
+              date: d.getDate(),
+              hour: d.getHours(),
+              minute: d.getMinutes(),
+              second: 0,
+              millisecond: 0,
+            });
+          } else if (moment) {
+            newTs = moment(custom);
+          }
+          row.message = { ...row.message, timestamp: newTs, renderContentOnly: false };
+          row.renderContentOnly = false;
         } catch {}
       })
     );
-    patches.push(restoreAllTimestamps); // put genuine times back on unload
   }
 
   // 2) ACTION SHEET: add a "Set custom time" row that selects the message
