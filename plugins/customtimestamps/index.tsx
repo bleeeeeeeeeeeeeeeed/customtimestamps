@@ -11,12 +11,14 @@ const { FormSection, FormRow, FormInput } = Forms;
 
 storage.overrides ??= {}; // { [messageId]: epochMillis }
 storage.hideSetTimeButton ??= false; // hide the "Set custom time" action-sheet row
+storage.syncDMList ??= true; // make the DM list time + order follow overrides
 
 const RowManager = findByName("RowManager");
 const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
 const moment = findByProps("isMoment");
 const MessageStore = findByStoreName("MessageStore");
 const SelectedChannelStore = findByStoreName("SelectedChannelStore");
+const ChannelStore = findByStoreName("ChannelStore");
 const dmModule = findByProps("getDMFromUserId");
 
 const patches: (() => void)[] = [];
@@ -93,6 +95,77 @@ function safeEpoch(value: any): number {
     return isNaN(t) ? Date.now() : t;
   } catch {
     return Date.now();
+  }
+}
+
+// ---- DM list sync ----------------------------------------------------------
+// The DM list shows each channel's last-message time and sorts by it; both come
+// from the channel's `lastMessageId` snowflake (its top 42 bits encode the ms).
+// We can therefore build a fake id that decodes to any time we want, so the
+// native list both displays and orders the DM as if sent at the override time.
+const DISCORD_EPOCH = 1420070400000;
+
+function snowflakeFromEpoch(ms: number): string | null {
+  try {
+    if (typeof BigInt === "undefined") return null;
+    return ((BigInt(Math.floor(ms)) - BigInt(DISCORD_EPOCH)) << BigInt(22)).toString();
+  } catch {
+    return null;
+  }
+}
+
+// channelId -> the genuine lastMessageId we replaced, and the fake we wrote in
+// its place. Lets us tell our own synthetic id apart from a brand-new real
+// message (so a freshly sent message is picked up instead of ignored) and lets
+// us restore the original on unload or when an override is removed.
+const dmRealId: Record<string, string> = {};
+const dmFakeId: Record<string, string> = {};
+
+function syncChannelLastMessage(channel: any): void {
+  try {
+    if (!channel?.id) return;
+    const cid = channel.id;
+    const cur = channel.lastMessageId;
+
+    // Recover the genuine last message id. If the current value is the fake we
+    // last wrote, the real id is the one we stashed; otherwise Discord set a
+    // genuine value (an unchanged or newly arrived message) — trust it.
+    let real: string | null | undefined;
+    if (cur != null && cur === dmFakeId[cid]) {
+      real = dmRealId[cid];
+    } else {
+      real = cur;
+      delete dmRealId[cid];
+      delete dmFakeId[cid];
+    }
+
+    if (real == null) return;
+
+    const ov = storage.syncDMList ? storage.overrides[real] : undefined;
+    if (ov != null) {
+      const fake = snowflakeFromEpoch(ov);
+      if (fake) {
+        dmRealId[cid] = real;
+        dmFakeId[cid] = fake;
+        channel.lastMessageId = fake;
+        return;
+      }
+    }
+    // No (usable) override, or the feature is off: make sure the real id stands.
+    if (channel.lastMessageId !== real) channel.lastMessageId = real;
+    delete dmRealId[cid];
+    delete dmFakeId[cid];
+  } catch {}
+}
+
+function restoreAllChannels(): void {
+  for (const cid of Object.keys(dmRealId)) {
+    try {
+      const ch = ChannelStore?.getChannel?.(cid);
+      if (ch && dmRealId[cid]) ch.lastMessageId = dmRealId[cid];
+    } catch {}
+    delete dmRealId[cid];
+    delete dmFakeId[cid];
   }
 }
 
@@ -319,6 +392,22 @@ function Settings() {
         <FormRow label="Auto-distance blocks" onPress={applyDistance} />
       </FormSection>
 
+      <FormSection title="DM list">
+        <FormRow
+          label={
+            storage.syncDMList
+              ? "Sync DM list with overrides: ON (tap to turn off)"
+              : "Sync DM list with overrides: OFF (tap to turn on)"
+          }
+          subLabel="Makes the right-side time and the DM order follow the spoofed last message"
+          onPress={() => {
+            storage.syncDMList = !storage.syncDMList;
+            if (!storage.syncDMList) restoreAllChannels();
+            showToast(storage.syncDMList ? "DM list sync ON" : "DM list sync OFF");
+          }}
+        />
+      </FormSection>
+
       <FormSection title="Current overrides (tap to remove)">
         <FormRow
           label="Clear ALL overrides"
@@ -417,24 +506,37 @@ function setup() {
     );
   }
 
-  // 3) DM LIST: the short relative time ("1m", "1h", "1d") on each DM row is
-  // derived from the last message's snowflake (the message id encodes a time).
-  // Make snowflake -> time honor overrides, so the list matches the last
-  // message's displayed time whether it was spoofed or not. Only ids that are
-  // actually overridden are affected; everything else passes through untouched.
-  const SnowflakeUtils = findByProps("extractTimestamp", "fromTimestamp");
-  if (SnowflakeUtils?.extractTimestamp) {
-    patches.push(
-      after("extractTimestamp", SnowflakeUtils, ([id]: any, res: any) => {
-        try {
-          if (id != null && storage.overrides[id] != null) {
-            const ov = storage.overrides[id];
-            return res instanceof Date ? new Date(ov) : ov;
-          }
-        } catch {}
-        return res;
-      })
-    );
+  // 3) DM LIST: make the right-side time ("19m", "15h", "1d") AND the list
+  // ordering follow overrides. Both come from each channel's `lastMessageId`,
+  // so we hand back a synthetic id encoding the override time. Only channels
+  // whose current last message is overridden are touched; the original id is
+  // tracked and restored otherwise (and on unload).
+  if (ChannelStore) {
+    // Channels handed out individually (row rendering, opening a DM, etc).
+    if (ChannelStore.getChannel) {
+      patches.push(
+        after("getChannel", ChannelStore, (_args: any, channel: any) => {
+          syncChannelLastMessage(channel);
+          return channel;
+        })
+      );
+    }
+    // The map/array the DM list reads to sort — sync every channel so ordering
+    // reflects the override even if a row never went through getChannel first.
+    for (const fn of ["getSortedPrivateChannels", "getMutablePrivateChannels"]) {
+      if (typeof (ChannelStore as any)[fn] !== "function") continue;
+      patches.push(
+        after(fn, ChannelStore, (_args: any, res: any) => {
+          try {
+            if (Array.isArray(res)) res.forEach(syncChannelLastMessage);
+            else if (res && typeof res === "object") Object.values(res).forEach(syncChannelLastMessage);
+          } catch {}
+          return res;
+        })
+      );
+    }
+    // Put genuine ids back when the plugin unloads.
+    patches.push(restoreAllChannels);
   }
 }
 
