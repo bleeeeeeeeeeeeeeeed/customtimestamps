@@ -195,22 +195,43 @@ function Settings() {
     if (!channelId) channelId = SelectedChannelStore?.getChannelId?.();
     if (!channelId) { showToast("Open the DM, or enter a Channel ID"); return; }
 
-    let cur = parseStamp((storage.distStart ?? "").trim() || "Yesterday 8:30 PM");
-    if (isNaN(cur)) { showToast("Bad start time"); return; }
+    let start = parseStamp((storage.distStart ?? "").trim() || "Yesterday 8:30 PM");
+    if (isNaN(start)) { showToast("Bad start time"); return; }
 
     const [minMs, maxMs] = parseGap(storage.distRange ?? "4-7");
 
     const msgs = getMessagesArray(channelId);
     if (!msgs.length) { showToast("No loaded messages — open/scroll the DM first"); return; }
-    const blocks = buildBlocks(msgs);
+    const blocks = buildBlocks(msgs); // oldest -> newest
+
+    // Pick the random gaps up front so we know the full span (oldest..newest)
+    // before deciding where to anchor it.
+    const offsets: number[] = [0];
+    for (let i = 1; i < blocks.length; i++) {
+      offsets.push(offsets[i - 1] + minMs + Math.random() * (maxMs - minMs));
+    }
+    const totalSpan = offsets[offsets.length - 1];
+
+    // Messages live in the past, so the newest block can't be in the future.
+    // If walking forward from `start` would overshoot now, slide the whole
+    // sequence back (by as many days as needed) so the newest block lands at now.
+    const now = Date.now();
+    let shifted = false;
+    if (start + totalSpan > now) {
+      start = now - totalSpan;
+      shifted = true;
+    }
 
     let applied = 0;
     for (let i = 0; i < blocks.length; i++) {
-      if (i > 0) cur += minMs + Math.random() * (maxMs - minMs);
-      storage.overrides[blocks[i].id] = cur;
+      storage.overrides[blocks[i].id] = Math.round(start + offsets[i]);
       applied++;
     }
-    showToast("Distanced " + applied + " blocks — scroll to refresh");
+    showToast(
+      "Distanced " + applied + " blocks" +
+      (shifted ? " (shifted back to fit before now)" : "") +
+      " — scroll to refresh"
+    );
   };
 
   const ovr = storage.overrides ?? {};
