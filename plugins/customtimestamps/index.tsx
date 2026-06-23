@@ -198,6 +198,79 @@ function getMessagesArray(channelId: string): any[] {
   return [];
 }
 
+// ---- Grouping + date divider (safe, output-only) --------------------------
+// How close (in spoofed time) two same-author messages must be to render as one
+// group. Discord's own window is ~7 min; a little wider feels natural for spoofs.
+const GROUP_WINDOW_MS = 10 * 60 * 1000;
+
+// Find a message's immediate predecessor without rescanning the channel each
+// render. Cache is keyed by channel + message count so new messages refresh it.
+let grpCache: { channelId: string; len: number; map: Record<string, number>; msgs: any[] } | null = null;
+function prevMessageOf(msg: any): any {
+  try {
+    const channelId = msg?.channel_id;
+    if (!channelId) return null;
+    let len = -1;
+    try { len = MessageStore?.getMessages?.(channelId)?.length ?? -1; } catch {}
+    if (!grpCache || grpCache.channelId !== channelId || grpCache.len !== len) {
+      const msgs = getMessagesArray(channelId);
+      const map: Record<string, number> = {};
+      for (let i = 0; i < msgs.length; i++) map[msgs[i].id] = i;
+      grpCache = { channelId, len: msgs.length, map, msgs };
+    }
+    const idx = grpCache.map[msg.id];
+    if (idx == null || idx <= 0) return null;
+    return grpCache.msgs[idx - 1];
+  } catch { return null; }
+}
+
+// Should this message tuck under the previous one (same author, close in spoofed
+// time, not a reply)? Uses each message's effective time (override or real) so
+// spoofing two messages near each other groups them like a normal pair.
+function groupsWithPrev(msg: any): boolean {
+  try {
+    if (msg?.messageReference) return false;
+    const prev = prevMessageOf(msg);
+    if (!prev) return false;
+    if (msg.author?.id !== prev.author?.id) return false;
+    const tCur = storage.overrides[msg.id] ?? safeEpoch(msg.timestamp);
+    const tPrev = storage.overrides[prev.id] ?? safeEpoch(prev.timestamp);
+    const gap = tCur - tPrev;
+    return gap >= 0 && gap <= GROUP_WINDOW_MS;
+  } catch { return false; }
+}
+
+// Discord's in-chat date-separator wording, e.g. "June 24, 2026".
+function dividerDateStr(ms: number): string {
+  try { return new Date(ms).toLocaleDateString([], { year: "numeric", month: "long", day: "numeric" }); }
+  catch { return ""; }
+}
+
+// Best-effort: if a date separator with the real date is baked into this row,
+// swap it for the spoofed date. Output-only and fully guarded — if it can't find
+// the text it does nothing, and it never touches Discord's generate input, so it
+// cannot crash the client the way the earlier data-layer attempt did.
+function swapDividerDate(row: any, realStr: string, spoofStr: string): void {
+  if (!realStr || realStr === spoofStr) return;
+  const seen = new Set<any>();
+  const walk = (node: any, depth: number) => {
+    if (!node || depth > 16 || typeof node !== "object" || seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) { for (const n of node) walk(n, depth + 1); return; }
+    const props = node.props;
+    if (props) {
+      if (props.children === realStr) { try { props.children = spoofStr; } catch {} }
+      else if (Array.isArray(props.children)) {
+        for (let i = 0; i < props.children.length; i++)
+          if (props.children[i] === realStr) { try { props.children[i] = spoofStr; } catch {} }
+      }
+      if (props.text === realStr) { try { props.text = spoofStr; } catch {} }
+      walk(props.children, depth + 1);
+    }
+  };
+  try { walk(row, 0); } catch {}
+}
+
 // Parse a gap spec like "4-7", "4-7h", "30-90m", "45m", "5" into [minMs, maxMs].
 function parseGap(spec: string): [number, number] {
   const s = (spec || "").trim().toLowerCase();
@@ -488,19 +561,29 @@ function Settings() {
 
 // ---------------- Patches ----------------
 function setup() {
-  // 1) DISPLAY: replace the rendered timestamp for overridden messages. We swap
-  // the timestamp on a shallow copy of the message *after* generate has run, so
-  // Discord's own generate never receives our value — feeding it a rebuilt
-  // timestamp crashed the client ("undefined is not a function"). This keeps the
-  // header relabel safe and fully reversible.
+  // 1) DISPLAY: relabel overridden messages by editing the already-generated row
+  // (a shallow copy) *after* generate has run. Discord's generate never receives
+  // our value — feeding it a rebuilt timestamp crashed the client. Two cases:
+  //   • grouped (same author, close spoofed time) -> render as a continuation so
+  //     the message tucks under the previous one with no repeated header;
+  //   • block leader -> show the header with the spoofed time, and best-effort
+  //     fix the date separator baked into the row.
   if (RowManager?.prototype?.generate) {
     patches.push(
       after("generate", RowManager.prototype, ([data]: any, row: any) => {
         try {
-          const id = row?.message?.id;
+          const msg = row?.message;
+          const id = msg?.id;
           if (!id || storage.overrides[id] == null) return;
           const custom = storage.overrides[id];
-          const ts = row.message.timestamp;
+
+          if (groupsWithPrev(msg)) {
+            row.message = { ...row.message, renderContentOnly: true };
+            row.renderContentOnly = true;
+            return;
+          }
+
+          const ts = msg.timestamp;
           let newTs: any = ts;
           if (typeof ts === "string" || ts == null) {
             newTs = formatStamp(custom);
@@ -520,6 +603,8 @@ function setup() {
           }
           row.message = { ...row.message, timestamp: newTs, renderContentOnly: false };
           row.renderContentOnly = false;
+
+          swapDividerDate(row, dividerDateStr(safeEpoch(ts)), dividerDateStr(custom));
         } catch {}
       })
     );
