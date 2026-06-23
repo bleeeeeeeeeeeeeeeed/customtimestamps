@@ -1,0 +1,7 @@
+{
+  "name": "CustomTimestamps",
+  "description": "Manually override the displayed time of any message.",
+  "authors": [{ "name": "you", "id": "0" }],
+  "main": "index.tsx",
+  "vendetta": { "icon": "ic_timer" }
+}
