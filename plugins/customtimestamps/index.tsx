@@ -169,6 +169,52 @@ function restoreAllChannels(): void {
   }
 }
 
+// ---- Stored-timestamp override --------------------------------------------
+// The date divider, day-grouping and "Yesterday/Today" wording are all
+// computed by Discord from the message's own `timestamp`. Relabelling only the
+// rendered header makes the divider disagree with it. So we set the spoofed
+// time on the stored message itself and keep the genuine value to restore.
+// Keyed by message id; we stash the object too so we can tell a reloaded
+// message (fresh object, real time) from one we already rewrote.
+const tsBackup: Record<string, { msg: any; ts: any }> = {};
+
+function buildTimestamp(baseTs: any, custom: number): any {
+  if (typeof baseTs === "string" || baseTs == null) return formatStamp(custom);
+  if (baseTs?.clone && baseTs?.set) {
+    const d = new Date(custom);
+    return baseTs.clone().set({
+      year: d.getFullYear(),
+      month: d.getMonth(),
+      date: d.getDate(),
+      hour: d.getHours(),
+      minute: d.getMinutes(),
+      second: 0,
+      millisecond: 0,
+    });
+  }
+  return moment ? moment(custom) : formatStamp(custom);
+}
+
+function applyTimestamp(msg: any, custom: number): void {
+  if (!msg?.id) return;
+  const id = msg.id;
+  // Capture the genuine timestamp once per message object.
+  if (!tsBackup[id] || tsBackup[id].msg !== msg) tsBackup[id] = { msg, ts: msg.timestamp };
+  msg.timestamp = buildTimestamp(tsBackup[id].ts, custom);
+}
+
+function restoreTimestamp(id: string): void {
+  const entry = tsBackup[id];
+  if (entry && entry.msg) {
+    try { entry.msg.timestamp = entry.ts; } catch {}
+  }
+  delete tsBackup[id];
+}
+
+function restoreAllTimestamps(): void {
+  for (const id of Object.keys(tsBackup)) restoreTimestamp(id);
+}
+
 function getMessagesArray(channelId: string): any[] {
   const col = MessageStore?.getMessages?.(channelId);
   if (!col) return [];
@@ -411,7 +457,7 @@ function Settings() {
       <FormSection title="Current overrides (tap to remove)">
         <FormRow
           label="Clear ALL overrides"
-          onPress={() => { storage.overrides = {}; showToast("Cleared all overrides"); }}
+          onPress={() => { storage.overrides = {}; restoreAllTimestamps(); showToast("Cleared all overrides"); }}
         />
         {Object.keys(ovr).length === 0
           ? <FormRow label="None yet" />
@@ -419,7 +465,7 @@ function Settings() {
               <FormRow
                 label={formatStamp(ovr[id])}
                 subLabel={id}
-                onPress={() => { delete storage.overrides[id]; showToast("Removed"); }}
+                onPress={() => { delete storage.overrides[id]; restoreTimestamp(id); showToast("Removed"); }}
               />
             ))}
       </FormSection>
@@ -429,39 +475,25 @@ function Settings() {
 
 // ---------------- Patches ----------------
 function setup() {
-  // 1) DISPLAY: replace the rendered timestamp for overridden messages
+  // 1) DISPLAY + GROUPING: set the spoofed time on the stored message so the
+  // header, the date divider, day-grouping and "Yesterday/Today" wording all
+  // read the same value and stay consistent. The genuine time is stashed and
+  // restored when the override is removed or the plugin unloads. (Re-grouping
+  // recomputes on the next list rebuild, so a scroll refreshes the dividers.)
   if (RowManager?.prototype?.generate) {
     patches.push(
       after("generate", RowManager.prototype, ([data]: any, row: any) => {
         try {
-          const id = row?.message?.id;
-          if (!id || storage.overrides[id] == null) return;
+          const msg = row?.message;
+          const id = msg?.id;
+          if (!id) return;
           const custom = storage.overrides[id];
-          const ts = row.message.timestamp;
-          let newTs: any = ts;
-          if (typeof ts === "string" || ts == null) {
-            newTs = formatStamp(custom);
-          } else if (ts?.clone && ts?.set) {
-            const d = new Date(custom);
-            newTs = ts.clone().set({
-              year: d.getFullYear(),
-              month: d.getMonth(),
-              date: d.getDate(),
-              hour: d.getHours(),
-              minute: d.getMinutes(),
-              second: 0,
-              millisecond: 0,
-            });
-          } else if (moment) {
-            newTs = moment(custom);
-          }
-          // Replace the message on this throwaway render row with a shallow copy so
-          // we never mutate Discord's stored message (keeps overrides reversible).
-          row.message = { ...row.message, timestamp: newTs, renderContentOnly: false };
-          row.renderContentOnly = false;
+          if (custom != null) applyTimestamp(msg, custom);
+          else if (tsBackup[id]) restoreTimestamp(id); // override was removed
         } catch {}
       })
     );
+    patches.push(restoreAllTimestamps); // put genuine times back on unload
   }
 
   // 2) ACTION SHEET: add a "Set custom time" row that selects the message
