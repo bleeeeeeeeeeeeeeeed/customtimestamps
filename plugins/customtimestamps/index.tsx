@@ -4,10 +4,28 @@ import { storage } from "@vendetta/plugin";
 import { useProxy } from "@vendetta/storage";
 import { showToast } from "@vendetta/ui/toasts";
 import { findInReactTree } from "@vendetta/utils";
+import { getAssetIDByName } from "@vendetta/ui/assets";
 import { Forms } from "@vendetta/ui/components";
 import { React, ReactNative } from "@vendetta/metro/common";
 
-const { FormSection, FormRow, FormInput } = Forms;
+const { FormSection, FormRow, FormInput, FormDivider, FormText } = Forms;
+// FormSwitchRow isn't on every build; fall back to a tappable row if missing.
+const FormSwitchRow =
+  Forms.FormSwitchRow ??
+  ((p: any) => (
+    <FormRow
+      label={p.label}
+      subLabel={p.subLabel}
+      leading={p.leading}
+      trailing={<FormText>{p.value ? "ON" : "OFF"}</FormText>}
+      onPress={() => p.onValueChange?.(!p.value)}
+    />
+  ));
+
+const Icon = (name: string) => {
+  const source = getAssetIDByName?.(name);
+  return source ? <FormRow.Icon source={source} /> : undefined;
+};
 
 storage.overrides ??= {}; // { [messageId]: epochMillis }
 storage.hideSetTimeButton ??= false; // hide the "Set custom time" action-sheet row
@@ -354,120 +372,158 @@ function Settings() {
   };
 
   const ovr = storage.overrides ?? {};
+  const ovrIds = Object.keys(ovr);
+  const targetMs = sel ? (storage.overrides[sel.id] ?? sel.original ?? Date.now()) : null;
+
   return (
     <ReactNative.ScrollView
       style={{ flex: 1 }}
       contentContainerStyle={{ paddingBottom: 600 }}
       keyboardShouldPersistTaps="handled"
     >
+      <FormText style={{ paddingHorizontal: 16, paddingTop: 14, paddingBottom: 2, opacity: 0.6 }}>
+        Long-press a message → “Set custom time”, then edit the date & time below.
+        Bulk tools relabel an entire DM at once.
+      </FormText>
+
+      {/* ---- Selected message ---- */}
       <FormSection title="Selected message">
-        <FormRow label={sel ? sel.preview : "None — long-press a message and tap 'Set custom time'"} />
         <FormRow
-          label="Deselect message"
-          onPress={() => {
-            try {
-              delete storage.selectedMessage;
-              showToast("Deselected");
-            } catch {}
-          }}
-        />
-        <FormRow
-          label={
-            storage.hideSetTimeButton
-              ? "'Set custom time' button: Hidden (tap to show)"
-              : "'Set custom time' button: Shown (tap to hide)"
+          label={sel ? sel.preview : "Nothing selected"}
+          subLabel={
+            sel
+              ? "Currently shows: " + formatStamp(targetMs as number)
+              : "Long-press a message and tap “Set custom time”"
           }
-          subLabel="Toggles the row in the message long-press menu"
-          onPress={() => {
-            storage.hideSetTimeButton = !storage.hideSetTimeButton;
-            showToast(storage.hideSetTimeButton ? "Button hidden" : "Button shown");
-          }}
+          leading={Icon("ic_message_edit")}
         />
+        {sel ? (
+          <>
+            <FormDivider />
+            <FormRow
+              label="Deselect"
+              leading={Icon("ic_close_circle_24px")}
+              onPress={() => { try { delete storage.selectedMessage; showToast("Deselected"); } catch {} }}
+            />
+          </>
+        ) : null}
       </FormSection>
 
-      <FormSection title="Date">
-        {numField("month", "Month (1-12)")}
+      {/* ---- Edit the time for the selected message ---- */}
+      <FormSection title="Edit time">
+        {numField("month", "Month (1–12)")}
         {numField("day", "Day")}
         {numField("year", "Year")}
-      </FormSection>
-
-      <FormSection title="Time">
-        {numField("hour", "Hour (1-12)")}
+        <FormDivider />
+        {numField("hour", "Hour (1–12)")}
         {numField("minute", "Minute")}
-        <FormRow
-          label={f.pm ? "PM  (tap to switch to AM)" : "AM  (tap to switch to PM)"}
-          onPress={() => up("pm", !f.pm)}
+        <FormSwitchRow
+          label={f.pm ? "PM" : "AM"}
+          subLabel={f.pm ? "Afternoon / evening" : "Morning"}
+          leading={Icon("clock")}
+          value={!!f.pm}
+          onValueChange={(v: boolean) => up("pm", v)}
         />
-        <FormRow label="Save for selected message" onPress={saveOne} />
+        <FormDivider />
+        <FormRow
+          label="Save for selected message"
+          subLabel={sel ? undefined : "Select a message first"}
+          leading={Icon("ic_check_24px")}
+          disabled={!sel}
+          onPress={saveOne}
+        />
       </FormSection>
 
-      <FormSection title="Auto-sequence a DM">
+      {/* ---- Bulk relabel a whole DM ---- */}
+      <FormSection title="Bulk tools · whole DM">
         <FormInput
-          title="Channel ID (optional — blank = current DM)"
+          title="Channel ID"
+          placeholder="Blank = current DM"
           value={friendId}
           keyboardType="numeric"
           onChange={(v: string) => { storage.channelId = v; }}
           onChangeText={(v: string) => { storage.channelId = v; }}
         />
+        <FormDivider />
         <FormInput
-          title="Times, oldest first (one per line or comma-separated)"
+          title="Sequence · times oldest first (one per line or comma-separated)"
           placeholder="Yesterday at 2:30 AM, 5:30 AM, 2:23 PM, 5:34 PM"
           value={seq}
           multiline={true}
           onChange={(v: string) => { storage.seqText = v; }}
           onChangeText={(v: string) => { storage.seqText = v; }}
         />
-        <FormRow label="Apply sequence to DM" onPress={applySequence} />
-      </FormSection>
-
-      <FormSection title="Auto-distance blocks (uses Channel ID above)">
+        <FormRow label="Apply sequence" leading={Icon("ic_history")} onPress={applySequence} />
+        <FormDivider />
         <FormInput
-          title="Start time (first block)"
+          title="Auto-distance · start time (first block)"
           placeholder="Yesterday 8:30 PM"
           value={storage.distStart ?? ""}
           onChange={(v: string) => { storage.distStart = v; }}
           onChangeText={(v: string) => { storage.distStart = v; }}
         />
         <FormInput
-          title="Distance apart (4-7h, 30-90m, 45m, 5h…)"
-          placeholder="4-7"
+          title="Auto-distance · gap between blocks"
+          placeholder="4-7h, 30-90m, 45m, 5h…"
           value={storage.distRange ?? ""}
           onChange={(v: string) => { storage.distRange = v; }}
           onChangeText={(v: string) => { storage.distRange = v; }}
         />
-        <FormRow label="Auto-distance blocks" onPress={applyDistance} />
+        <FormRow label="Auto-distance blocks" leading={Icon("ic_activity_24px")} onPress={applyDistance} />
       </FormSection>
 
-      <FormSection title="DM list">
-        <FormRow
-          label={
-            storage.syncDMList
-              ? "Sync DM list with overrides: ON (tap to turn off)"
-              : "Sync DM list with overrides: OFF (tap to turn on)"
-          }
-          subLabel="Makes the right-side time and the DM order follow the spoofed last message"
-          onPress={() => {
-            storage.syncDMList = !storage.syncDMList;
-            if (!storage.syncDMList) restoreAllChannels();
-            showToast(storage.syncDMList ? "DM list sync ON" : "DM list sync OFF");
+      {/* ---- Toggles ---- */}
+      <FormSection title="Options">
+        <FormSwitchRow
+          label="Sync DM list"
+          subLabel="DM-list time & order follow the spoofed last message"
+          leading={Icon("ic_message_retry")}
+          value={!!storage.syncDMList}
+          onValueChange={(v: boolean) => {
+            storage.syncDMList = v;
+            if (!v) restoreAllChannels();
+            showToast(v ? "DM list sync on" : "DM list sync off");
+          }}
+        />
+        <FormDivider />
+        <FormSwitchRow
+          label="Hide “Set custom time” button"
+          subLabel="Removes the row from the long-press menu"
+          leading={Icon("ic_eye_hide_24px")}
+          value={!!storage.hideSetTimeButton}
+          onValueChange={(v: boolean) => {
+            storage.hideSetTimeButton = v;
+            showToast(v ? "Button hidden" : "Button shown");
           }}
         />
       </FormSection>
 
-      <FormSection title="Current overrides (tap to remove)">
+      {/* ---- Active overrides ---- */}
+      <FormSection title={"Active overrides · " + ovrIds.length}>
         <FormRow
-          label="Clear ALL overrides"
+          label="Clear all overrides"
+          leading={Icon("ic_trash_24px")}
+          disabled={!ovrIds.length}
           onPress={() => { storage.overrides = {}; restoreAllTimestamps(); showToast("Cleared all overrides"); }}
         />
-        {Object.keys(ovr).length === 0
-          ? <FormRow label="None yet" />
-          : Object.keys(ovr).map((id) => (
+        {ovrIds.length === 0 ? (
+          <>
+            <FormDivider />
+            <FormRow label="No overrides yet" subLabel="Saved times will appear here" />
+          </>
+        ) : (
+          ovrIds.map((id) => (
+            <React.Fragment key={id}>
+              <FormDivider />
               <FormRow
                 label={formatStamp(ovr[id])}
-                subLabel={id}
+                subLabel={"Tap to remove · " + id}
+                leading={Icon("ic_timer")}
                 onPress={() => { delete storage.overrides[id]; restoreTimestamp(id); showToast("Removed"); }}
               />
-            ))}
+            </React.Fragment>
+          ))
+        )}
       </FormSection>
     </ReactNative.ScrollView>
   );
