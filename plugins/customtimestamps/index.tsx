@@ -416,6 +416,26 @@ function setup() {
       })
     );
   }
+
+  // 3) DM LIST: the short relative time ("1m", "1h", "1d") on each DM row is
+  // derived from the last message's snowflake (the message id encodes a time).
+  // Make snowflake -> time honor overrides, so the list matches the last
+  // message's displayed time whether it was spoofed or not. Only ids that are
+  // actually overridden are affected; everything else passes through untouched.
+  const SnowflakeUtils = findByProps("extractTimestamp", "fromTimestamp");
+  if (SnowflakeUtils?.extractTimestamp) {
+    patches.push(
+      after("extractTimestamp", SnowflakeUtils, ([id]: any, res: any) => {
+        try {
+          if (id != null && storage.overrides[id] != null) {
+            const ov = storage.overrides[id];
+            return res instanceof Date ? new Date(ov) : ov;
+          }
+        } catch {}
+        return res;
+      })
+    );
+  }
 }
 
 export default {
