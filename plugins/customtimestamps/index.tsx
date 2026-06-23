@@ -8,24 +8,35 @@ import { getAssetIDByName } from "@vendetta/ui/assets";
 import { Forms } from "@vendetta/ui/components";
 import { React, ReactNative } from "@vendetta/metro/common";
 
-const { FormSection, FormRow, FormInput, FormDivider, FormText } = Forms;
-// FormSwitchRow isn't on every build; fall back to a tappable row if missing.
-const FormSwitchRow =
-  Forms.FormSwitchRow ??
-  ((p: any) => (
-    <FormRow
-      label={p.label}
-      subLabel={p.subLabel}
-      leading={p.leading}
-      trailing={<FormText>{p.value ? "ON" : "OFF"}</FormText>}
-      onPress={() => p.onValueChange?.(!p.value)}
-    />
-  ));
+const { FormSection, FormRow, FormInput, FormDivider, FormText, FormSwitch } = Forms;
 
 const Icon = (name: string) => {
   const source = getAssetIDByName?.(name);
   return source ? <FormRow.Icon source={source} /> : undefined;
 };
+
+// A reliable toggle: the whole row is tappable via FormRow's onPress (which
+// works everywhere here), and the switch is shown purely for looks with touches
+// passed through to the row, so it can't get into a stuck/unresponsive state.
+function ToggleRow({ label, subLabel, leading, value, onToggle }: any) {
+  return (
+    <FormRow
+      label={label}
+      subLabel={subLabel}
+      leading={leading}
+      trailing={
+        FormSwitch ? (
+          <ReactNative.View pointerEvents="none">
+            <FormSwitch value={!!value} onValueChange={() => {}} />
+          </ReactNative.View>
+        ) : (
+          <FormText>{value ? "On" : "Off"}</FormText>
+        )
+      }
+      onPress={() => onToggle(!value)}
+    />
+  );
+}
 
 storage.overrides ??= {}; // { [messageId]: epochMillis }
 storage.hideSetTimeButton ??= false; // hide the "Set custom time" action-sheet row
@@ -233,6 +244,17 @@ function restoreAllTimestamps(): void {
   for (const id of Object.keys(tsBackup)) restoreTimestamp(id);
 }
 
+// Apply an override to the already-loaded stored message right away (not just at
+// render time), so when the channel is reopened the row list — and therefore the
+// date dividers and grouping — is rebuilt from the spoofed time.
+function eagerApply(channelId: string | undefined, id: string, epoch: number): void {
+  try {
+    if (!channelId) return;
+    const msg = MessageStore?.getMessage?.(channelId, id);
+    if (msg) applyTimestamp(msg, epoch);
+  } catch {}
+}
+
 function getMessagesArray(channelId: string): any[] {
   const col = MessageStore?.getMessages?.(channelId);
   if (!col) return [];
@@ -303,7 +325,8 @@ function Settings() {
     const epoch = new Date(Y, M - 1, D, h, mm, 0, 0).getTime();
     if (isNaN(epoch)) { showToast("Invalid date/time"); return; }
     storage.overrides[sel.id] = epoch;
-    showToast("Saved — scroll the chat to refresh");
+    eagerApply(sel.channelId, sel.id, epoch);
+    showToast("Saved — reopen the DM to refresh dividers");
   };
 
   const applySequence = () => {
@@ -322,9 +345,13 @@ function Settings() {
     let applied = 0;
     for (let i = 0; i < lines.length && i < blocks.length; i++) {
       const ep = parseStamp(lines[i]);
-      if (!isNaN(ep)) { storage.overrides[blocks[i].id] = ep; applied++; }
+      if (!isNaN(ep)) {
+        storage.overrides[blocks[i].id] = ep;
+        applyTimestamp(blocks[i], ep); // eagerly relabel the loaded message
+        applied++;
+      }
     }
-    showToast("blocks=" + blocks.length + " applied=" + applied + " — scroll to refresh");
+    showToast("blocks=" + blocks.length + " applied=" + applied + " — reopen the DM to refresh");
   };
 
   const applyDistance = () => {
@@ -361,13 +388,15 @@ function Settings() {
 
     let applied = 0;
     for (let i = 0; i < blocks.length; i++) {
-      storage.overrides[blocks[i].id] = Math.round(start + offsets[i]);
+      const ep = Math.round(start + offsets[i]);
+      storage.overrides[blocks[i].id] = ep;
+      applyTimestamp(blocks[i], ep); // eagerly relabel the loaded message
       applied++;
     }
     showToast(
       "Distanced " + applied + " blocks" +
       (shifted ? " (shifted back to fit before now)" : "") +
-      " — scroll to refresh"
+      " — reopen the DM to refresh"
     );
   };
 
@@ -417,12 +446,12 @@ function Settings() {
         <FormDivider />
         {numField("hour", "Hour (1–12)")}
         {numField("minute", "Minute")}
-        <FormSwitchRow
+        <ToggleRow
           label={f.pm ? "PM" : "AM"}
           subLabel={f.pm ? "Afternoon / evening" : "Morning"}
           leading={Icon("clock")}
           value={!!f.pm}
-          onValueChange={(v: boolean) => up("pm", v)}
+          onToggle={(v: boolean) => up("pm", v)}
         />
         <FormDivider />
         <FormRow
@@ -474,24 +503,24 @@ function Settings() {
 
       {/* ---- Toggles ---- */}
       <FormSection title="Options">
-        <FormSwitchRow
+        <ToggleRow
           label="Sync DM list"
           subLabel="DM-list time & order follow the spoofed last message"
           leading={Icon("ic_message_retry")}
           value={!!storage.syncDMList}
-          onValueChange={(v: boolean) => {
+          onToggle={(v: boolean) => {
             storage.syncDMList = v;
             if (!v) restoreAllChannels();
             showToast(v ? "DM list sync on" : "DM list sync off");
           }}
         />
         <FormDivider />
-        <FormSwitchRow
+        <ToggleRow
           label="Hide “Set custom time” button"
           subLabel="Removes the row from the long-press menu"
           leading={Icon("ic_eye_hide_24px")}
           value={!!storage.hideSetTimeButton}
-          onValueChange={(v: boolean) => {
+          onToggle={(v: boolean) => {
             storage.hideSetTimeButton = v;
             showToast(v ? "Button hidden" : "Button shown");
           }}
@@ -533,14 +562,15 @@ function Settings() {
 function setup() {
   // 1) DISPLAY + GROUPING: set the spoofed time on the stored message so the
   // header, the date divider, day-grouping and "Yesterday/Today" wording all
-  // read the same value and stay consistent. The genuine time is stashed and
-  // restored when the override is removed or the plugin unloads. (Re-grouping
-  // recomputes on the next list rebuild, so a scroll refreshes the dividers.)
+  // read the same value and stay consistent. This runs *before* generate so the
+  // date-divider text (which generate bakes in eagerly) is built from the
+  // spoofed time too — an `after` hook was too late for it. The genuine time is
+  // stashed and restored when the override is removed or the plugin unloads.
   if (RowManager?.prototype?.generate) {
     patches.push(
-      after("generate", RowManager.prototype, ([data]: any, row: any) => {
+      before("generate", RowManager.prototype, ([data]: any) => {
         try {
-          const msg = row?.message;
+          const msg = data?.message;
           const id = msg?.id;
           if (!id) return;
           const custom = storage.overrides[id];
@@ -579,6 +609,7 @@ function setup() {
                   onPress: () => {
                     storage.selectedMessage = {
                       id: message.id,
+                      channelId: message.channel_id,
                       preview: String(message.content || "").slice(0, 40) || message.id,
                       original: safeEpoch(message.timestamp),
                     };
