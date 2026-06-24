@@ -246,29 +246,69 @@ function dividerDateStr(ms: number): string {
   catch { return ""; }
 }
 
-// Best-effort: if a date separator with the real date is baked into this row,
-// swap it for the spoofed date. Output-only and fully guarded — if it can't find
-// the text it does nothing, and it never touches Discord's generate input, so it
-// cannot crash the client the way the earlier data-layer attempt did.
-function swapDividerDate(row: any, realStr: string, spoofStr: string): void {
-  if (!realStr || realStr === spoofStr) return;
-  const seen = new Set<any>();
-  const walk = (node: any, depth: number) => {
-    if (!node || depth > 16 || typeof node !== "object" || seen.has(node)) return;
-    seen.add(node);
-    if (Array.isArray(node)) { for (const n of node) walk(n, depth + 1); return; }
-    const props = node.props;
-    if (props) {
-      if (props.children === realStr) { try { props.children = spoofStr; } catch {} }
-      else if (Array.isArray(props.children)) {
-        for (let i = 0; i < props.children.length; i++)
-          if (props.children[i] === realStr) { try { props.children[i] = spoofStr; } catch {} }
-      }
-      if (props.text === realStr) { try { props.text = spoofStr; } catch {} }
-      walk(props.children, depth + 1);
+// The date separator is its own row (no `.message`), so we can't key it off a
+// message id. Instead build a map of every real day-string that an override
+// moves to a different day -> the spoofed day-string, taken from the first
+// message of each real day. Then we just relabel any matching date text in any
+// row. Cached per channel + message count.
+function buildDayMap(channelId: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  const msgs = getMessagesArray(channelId); // oldest -> newest
+  let lastRealDay = "";
+  for (const m of msgs) {
+    const realDay = dividerDateStr(safeEpoch(m.timestamp));
+    if (realDay === lastRealDay) continue; // only the first message of each real day
+    lastRealDay = realDay;
+    const ov = storage.overrides[m.id];
+    if (ov != null) {
+      const spoofDay = dividerDateStr(ov);
+      if (spoofDay && spoofDay !== realDay) map[realDay] = spoofDay;
     }
-  };
-  try { walk(row, 0); } catch {}
+  }
+  return map;
+}
+
+let dayMapCache: { channelId: string; len: number; map: Record<string, string> } | null = null;
+function getDayMap(channelId: string): Record<string, string> {
+  let len = -1;
+  try { len = MessageStore?.getMessages?.(channelId)?.length ?? -1; } catch {}
+  if (!dayMapCache || dayMapCache.channelId !== channelId || dayMapCache.len !== len) {
+    dayMapCache = { channelId, len, map: buildDayMap(channelId) };
+  }
+  return dayMapCache.map;
+}
+
+// Output-only, fully guarded: walk an already-generated row and relabel any date
+// text found in the day map. Never touches generate's input, so unlike the
+// reverted data-layer attempt it cannot crash the client.
+function remapDates(row: any, channelId: string | undefined): void {
+  try {
+    if (!channelId) return;
+    const map = getDayMap(channelId);
+    if (!map || !Object.keys(map).length) return;
+    const seen = new Set<any>();
+    const walk = (node: any, depth: number) => {
+      if (!node || depth > 16 || typeof node !== "object" || seen.has(node)) return;
+      seen.add(node);
+      if (Array.isArray(node)) { for (const n of node) walk(n, depth + 1); return; }
+      const props = node.props;
+      if (props) {
+        if (typeof props.children === "string" && map[props.children]) {
+          try { props.children = map[props.children]; } catch {}
+        } else if (Array.isArray(props.children)) {
+          for (let i = 0; i < props.children.length; i++) {
+            const c = props.children[i];
+            if (typeof c === "string" && map[c]) { try { props.children[i] = map[c]; } catch {} }
+          }
+        }
+        if (typeof props.text === "string" && map[props.text]) {
+          try { props.text = map[props.text]; } catch {}
+        }
+        walk(props.children, depth + 1);
+      }
+    };
+    walk(row, 0);
+  } catch {}
 }
 
 // Parse a gap spec like "4-7", "4-7h", "30-90m", "45m", "5" into [minMs, maxMs].
@@ -574,7 +614,14 @@ function setup() {
         try {
           const msg = row?.message;
           const id = msg?.id;
-          if (!id || storage.overrides[id] == null) return;
+
+          // Non-message rows (e.g. the date separator) — relabel any date text.
+          if (!id) {
+            remapDates(row, SelectedChannelStore?.getChannelId?.());
+            return;
+          }
+
+          if (storage.overrides[id] == null) return;
           const custom = storage.overrides[id];
 
           if (groupsWithPrev(msg)) {
@@ -604,7 +651,8 @@ function setup() {
           row.message = { ...row.message, timestamp: newTs, renderContentOnly: false };
           row.renderContentOnly = false;
 
-          swapDividerDate(row, dividerDateStr(safeEpoch(ts)), dividerDateStr(custom));
+          // Some builds bake the separator into the message row — cover that too.
+          remapDates(row, msg.channel_id);
         } catch {}
       })
     );
