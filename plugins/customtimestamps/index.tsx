@@ -33,6 +33,7 @@ function ToggleRow({ label, subLabel, leading, value, onToggle }: any) {
 storage.overrides ??= {}; // { [messageId]: epochMillis }
 storage.hideSetTimeButton ??= false; // hide the "Set custom time" action-sheet row
 storage.syncDMList ??= true; // make the DM list time + order follow overrides
+storage.debugCapture ??= false; // capture non-message row structures for troubleshooting
 
 const RowManager = findByName("RowManager");
 const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
@@ -279,8 +280,6 @@ function getDayMap(channelId: string): Record<string, DayEntry> {
   return dayMapCache.map;
 }
 
-const TIME_KEY = /time|stamp|date/i;
-
 // The day-string of a timestamp-ish value (epoch number, Date, or moment).
 function dayOfValue(v: any): string | null {
   try {
@@ -290,7 +289,7 @@ function dayOfValue(v: any): string | null {
       ms = v;
     } else if (v instanceof Date) {
       ms = v.getTime();
-    } else if (v && typeof v.valueOf === "function" && (v._isAMomentObject || typeof v.clone === "function")) {
+    } else if (v && v._isAMomentObject && typeof v.valueOf === "function") {
       ms = v.valueOf();
     } else return null;
     return dividerDateStr(ms);
@@ -314,10 +313,11 @@ function shiftToDay(v: any, spoofMs: number): any {
   } catch { return v; }
 }
 
-// Output-only, fully guarded: walk an already-generated row and relabel dates,
-// whether they appear as a finished string (e.g. "June 24, 2026") or as a
-// timestamp value on a time-like prop that a child formats. Never touches
-// generate's input, so unlike the reverted data-layer attempt it can't crash.
+// Output-only, fully guarded: the rows generate() returns are plain data objects
+// (that's why setting row.message.timestamp works), so walk the row's own
+// properties — not React props — and relabel any date, whether it's a finished
+// string ("June 24, 2026") or a timestamp value (epoch number / Date / moment)
+// whose day was spoofed. Never touches generate's input, so it can't crash.
 function remapDates(row: any, channelId: string | undefined): void {
   try {
     if (!channelId) return;
@@ -325,27 +325,60 @@ function remapDates(row: any, channelId: string | undefined): void {
     if (!map || !Object.keys(map).length) return;
     const seen = new Set<any>();
     const walk = (node: any, depth: number) => {
-      if (!node || depth > 16 || typeof node !== "object" || seen.has(node)) return;
+      if (!node || depth > 8 || typeof node !== "object" || seen.has(node)) return;
       seen.add(node);
       if (Array.isArray(node)) { for (const n of node) walk(n, depth + 1); return; }
-      const props = node.props;
-      if (props) {
-        for (const key of Object.keys(props)) {
-          const val = props[key];
-          if (typeof val === "string") {
-            if (map[val]) { try { props[key] = map[val].str; } catch {} }
-          } else if (Array.isArray(val)) {
-            for (let i = 0; i < val.length; i++)
-              if (typeof val[i] === "string" && map[val[i]]) { try { val[i] = map[val[i]].str; } catch {} }
-          } else if (TIME_KEY.test(key)) {
-            const day = dayOfValue(val);
-            if (day && map[day]) { try { props[key] = shiftToDay(val, map[day].ms); } catch {} }
-          }
+      for (const key of Object.keys(node)) {
+        let val: any;
+        try { val = node[key]; } catch { continue; }
+        if (typeof val === "string") {
+          if (map[val]) { try { node[key] = map[val].str; } catch {} }
+        } else if (typeof val === "number") {
+          const day = dayOfValue(val);
+          if (day && map[day]) { try { node[key] = shiftToDay(val, map[day].ms); } catch {} }
+        } else if (val && typeof val === "object") {
+          const day = dayOfValue(val); // Date / moment
+          if (day && map[day]) { try { node[key] = shiftToDay(val, map[day].ms); } catch {} }
+          else walk(val, depth + 1);
         }
-        walk(props.children, depth + 1);
       }
     };
     walk(row, 0);
+  } catch {}
+}
+
+// ---- Debug capture (off by default) ---------------------------------------
+// Compactly describe a value so the structure of a non-message row can be read
+// in the settings screen. Depth/size limited and cycle-safe.
+function describeNode(node: any, depth: number, seen: Set<any>): string {
+  try {
+    if (node == null) return String(node);
+    const t = typeof node;
+    if (t === "string") return JSON.stringify(node.length > 50 ? node.slice(0, 50) + "…" : node);
+    if (t === "number" || t === "boolean") return String(node);
+    if (t === "function") return "ƒ";
+    if (depth > 3) return "…";
+    if (seen.has(node)) return "<cycle>";
+    seen.add(node);
+    if (node instanceof Date) return "Date(" + node.toISOString() + ")";
+    if (node._isAMomentObject) { try { return "moment(" + node.format() + ")"; } catch { return "moment"; } }
+    if (Array.isArray(node))
+      return "[" + node.slice(0, 5).map((n) => describeNode(n, depth + 1, seen)).join(", ") +
+        (node.length > 5 ? ", +" + (node.length - 5) : "") + "]";
+    const keys = Object.keys(node).slice(0, 14);
+    return "{" + keys.map((k) => k + ": " + describeNode(node[k], depth + 1, seen)).join(", ") +
+      (Object.keys(node).length > 14 ? ", …" : "") + "}";
+  } catch { return "?"; }
+}
+
+function captureRow(row: any): void {
+  try {
+    if ((storage.debugDump || "").length > 4500) return; // keep it bounded
+    const s = describeNode(row, 0, new Set());
+    const sig = s.slice(0, 60);
+    if ((storage.debugSeen || "").indexOf(sig) !== -1) return; // already captured this shape
+    storage.debugSeen = ((storage.debugSeen || "") + "¦" + sig).slice(-3000);
+    storage.debugDump = ((storage.debugDump || "") + "\n\n" + s).slice(-6000);
   } catch {}
 }
 
@@ -633,6 +666,30 @@ function Settings() {
           ))
         )}
       </FormSection>
+
+      {/* ---- Debug (only for troubleshooting the date separator) ---- */}
+      <FormSection title="Debug">
+        <ToggleRow
+          label="Capture row structure"
+          subLabel="Turn on, open a DM with a spoofed date, come back here"
+          leading={Icon("ic_bug")}
+          value={!!storage.debugCapture}
+          onToggle={(v: boolean) => {
+            storage.debugCapture = v;
+            if (v) { storage.debugDump = ""; storage.debugSeen = ""; }
+            showToast(v ? "Capturing — open a spoofed DM" : "Capture off");
+          }}
+        />
+        <FormDivider />
+        <FormRow
+          label="Clear capture"
+          leading={Icon("ic_trash_24px")}
+          onPress={() => { storage.debugDump = ""; storage.debugSeen = ""; showToast("Cleared"); }}
+        />
+        <FormText style={{ padding: 12, fontSize: 11, fontFamily: "monospace" }}>
+          {storage.debugDump || "(nothing captured yet)"}
+        </FormText>
+      </FormSection>
     </ReactNative.ScrollView>
   );
 }
@@ -656,6 +713,7 @@ function setup() {
           // Non-message rows (e.g. the date separator) — relabel any date text.
           if (!id) {
             remapDates(row, SelectedChannelStore?.getChannelId?.());
+            if (storage.debugCapture) captureRow(row);
             return;
           }
 
@@ -688,9 +746,6 @@ function setup() {
           }
           row.message = { ...row.message, timestamp: newTs, renderContentOnly: false };
           row.renderContentOnly = false;
-
-          // Some builds bake the separator into the message row — cover that too.
-          remapDates(row, msg.channel_id);
         } catch {}
       })
     );
