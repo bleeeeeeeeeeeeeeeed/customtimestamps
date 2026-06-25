@@ -251,8 +251,9 @@ function dividerDateStr(ms: number): string {
 // moves to a different day -> the spoofed day-string, taken from the first
 // message of each real day. Then we just relabel any matching date text in any
 // row. Cached per channel + message count.
-function buildDayMap(channelId: string): Record<string, string> {
-  const map: Record<string, string> = {};
+type DayEntry = { str: string; ms: number };
+function buildDayMap(channelId: string): Record<string, DayEntry> {
+  const map: Record<string, DayEntry> = {};
   const msgs = getMessagesArray(channelId); // oldest -> newest
   let lastRealDay = "";
   for (const m of msgs) {
@@ -262,14 +263,14 @@ function buildDayMap(channelId: string): Record<string, string> {
     const ov = storage.overrides[m.id];
     if (ov != null) {
       const spoofDay = dividerDateStr(ov);
-      if (spoofDay && spoofDay !== realDay) map[realDay] = spoofDay;
+      if (spoofDay && spoofDay !== realDay) map[realDay] = { str: spoofDay, ms: ov };
     }
   }
   return map;
 }
 
-let dayMapCache: { channelId: string; len: number; map: Record<string, string> } | null = null;
-function getDayMap(channelId: string): Record<string, string> {
+let dayMapCache: { channelId: string; len: number; map: Record<string, DayEntry> } | null = null;
+function getDayMap(channelId: string): Record<string, DayEntry> {
   let len = -1;
   try { len = MessageStore?.getMessages?.(channelId)?.length ?? -1; } catch {}
   if (!dayMapCache || dayMapCache.channelId !== channelId || dayMapCache.len !== len) {
@@ -278,9 +279,45 @@ function getDayMap(channelId: string): Record<string, string> {
   return dayMapCache.map;
 }
 
-// Output-only, fully guarded: walk an already-generated row and relabel any date
-// text found in the day map. Never touches generate's input, so unlike the
-// reverted data-layer attempt it cannot crash the client.
+const TIME_KEY = /time|stamp|date/i;
+
+// The day-string of a timestamp-ish value (epoch number, Date, or moment).
+function dayOfValue(v: any): string | null {
+  try {
+    let ms: number;
+    if (typeof v === "number") {
+      if (v < 1e12 || v > 2e13) return null; // not a plausible ms epoch
+      ms = v;
+    } else if (v instanceof Date) {
+      ms = v.getTime();
+    } else if (v && typeof v.valueOf === "function" && (v._isAMomentObject || typeof v.clone === "function")) {
+      ms = v.valueOf();
+    } else return null;
+    return dividerDateStr(ms);
+  } catch { return null; }
+}
+
+// Return `v` with its calendar day shifted to that of `spoofMs`, preserving type.
+function shiftToDay(v: any, spoofMs: number): any {
+  try {
+    const d0 = new Date(spoofMs);
+    if (typeof v === "number") {
+      const d = new Date(v); d.setFullYear(d0.getFullYear(), d0.getMonth(), d0.getDate()); return d.getTime();
+    }
+    if (v instanceof Date) {
+      const d = new Date(v.getTime()); d.setFullYear(d0.getFullYear(), d0.getMonth(), d0.getDate()); return d;
+    }
+    if (v && typeof v.clone === "function" && typeof v.set === "function") {
+      return v.clone().set({ year: d0.getFullYear(), month: d0.getMonth(), date: d0.getDate() });
+    }
+    return v;
+  } catch { return v; }
+}
+
+// Output-only, fully guarded: walk an already-generated row and relabel dates,
+// whether they appear as a finished string (e.g. "June 24, 2026") or as a
+// timestamp value on a time-like prop that a child formats. Never touches
+// generate's input, so unlike the reverted data-layer attempt it can't crash.
 function remapDates(row: any, channelId: string | undefined): void {
   try {
     if (!channelId) return;
@@ -293,16 +330,17 @@ function remapDates(row: any, channelId: string | undefined): void {
       if (Array.isArray(node)) { for (const n of node) walk(n, depth + 1); return; }
       const props = node.props;
       if (props) {
-        if (typeof props.children === "string" && map[props.children]) {
-          try { props.children = map[props.children]; } catch {}
-        } else if (Array.isArray(props.children)) {
-          for (let i = 0; i < props.children.length; i++) {
-            const c = props.children[i];
-            if (typeof c === "string" && map[c]) { try { props.children[i] = map[c]; } catch {} }
+        for (const key of Object.keys(props)) {
+          const val = props[key];
+          if (typeof val === "string") {
+            if (map[val]) { try { props[key] = map[val].str; } catch {} }
+          } else if (Array.isArray(val)) {
+            for (let i = 0; i < val.length; i++)
+              if (typeof val[i] === "string" && map[val[i]]) { try { val[i] = map[val[i]].str; } catch {} }
+          } else if (TIME_KEY.test(key)) {
+            const day = dayOfValue(val);
+            if (day && map[day]) { try { props[key] = shiftToDay(val, map[day].ms); } catch {} }
           }
-        }
-        if (typeof props.text === "string" && map[props.text]) {
-          try { props.text = map[props.text]; } catch {}
         }
         walk(props.children, depth + 1);
       }
