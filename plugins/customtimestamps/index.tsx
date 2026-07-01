@@ -274,6 +274,10 @@ function buildDayMap(channelId: string): Record<string, DayEntry> {
 // separator rows (which have no channel) to the correct channel.
 let lastRowChannelId: string | undefined;
 
+// Debug counters (only used while debug capture is on).
+let dbgTotal = 0;
+let dbgNoMsg = 0;
+
 let dayMapCache: { channelId: string; len: number; map: Record<string, DayEntry> } | null = null;
 function getDayMap(channelId: string): Record<string, DayEntry> {
   let len = -1;
@@ -688,8 +692,11 @@ function Settings() {
         <FormRow
           label="Clear capture"
           leading={Icon("ic_trash_24px")}
-          onPress={() => { storage.debugDump = ""; storage.debugSeen = ""; showToast("Cleared"); }}
+          onPress={() => { storage.debugDump = ""; storage.debugSeen = ""; storage.debugStats = ""; showToast("Cleared"); }}
         />
+        <FormText style={{ paddingHorizontal: 12, paddingTop: 8, fontSize: 12, fontWeight: "600" }}>
+          {storage.debugStats || "(no rows seen yet)"}
+        </FormText>
         <FormText style={{ padding: 12, fontSize: 11, fontFamily: "monospace" }}>
           {storage.debugDump || "(nothing captured yet)"}
         </FormText>
@@ -718,6 +725,14 @@ function setup() {
           // (which carry no channel) can be tied to the right day-map even if
           // the "selected channel" store is momentarily stale during load.
           if (msg?.channel_id) lastRowChannelId = msg.channel_id;
+
+          if (storage.debugCapture) {
+            dbgTotal++;
+            if (!id) dbgNoMsg++;
+            if (!id || dbgTotal % 25 === 0) {
+              try { storage.debugStats = "seen " + dbgTotal + " rows, " + dbgNoMsg + " without a message"; } catch {}
+            }
+          }
 
           // Non-message rows (e.g. the date separator) — relabel any date text.
           if (!id) {
