@@ -270,6 +270,10 @@ function buildDayMap(channelId: string): Record<string, DayEntry> {
   return map;
 }
 
+// Channel of the most recent message row seen by generate — used to attribute
+// separator rows (which have no channel) to the correct channel.
+let lastRowChannelId: string | undefined;
+
 let dayMapCache: { channelId: string; len: number; map: Record<string, DayEntry> } | null = null;
 function getDayMap(channelId: string): Record<string, DayEntry> {
   let len = -1;
@@ -710,9 +714,14 @@ function setup() {
           const msg = row?.message;
           const id = msg?.id;
 
+          // Remember the channel of the surrounding messages so separator rows
+          // (which carry no channel) can be tied to the right day-map even if
+          // the "selected channel" store is momentarily stale during load.
+          if (msg?.channel_id) lastRowChannelId = msg.channel_id;
+
           // Non-message rows (e.g. the date separator) — relabel any date text.
           if (!id) {
-            remapDates(row, SelectedChannelStore?.getChannelId?.());
+            remapDates(row, lastRowChannelId || SelectedChannelStore?.getChannelId?.());
             if (storage.debugCapture) captureRow(row);
             return;
           }
